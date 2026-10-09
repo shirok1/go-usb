@@ -132,15 +132,10 @@ func (h *DeviceHandle) Close() error {
 	return syscall.Close(h.fd)
 }
 
-// registerURBCompletion registers a URB for completion notification,
-// starting the reap loop (and its wake pipe) on first use.
-//
-// Returns an error only if creating that wake pipe fails, which in
-// practice means the process is out of file descriptors entirely --
-// essentially never, but the caller has already submitted the URB to the
-// kernel by this point, so on error it must discard that URB rather than
-// leave it dangling with no registered callback.
-func (h *DeviceHandle) registerURBCompletion(urbPtr uintptr, callback func(error)) error {
+// submitRegisteredURB publishes the callback before submitting to usbfs. The
+// reaper uses the same mutex, so even an immediate completion has a callback.
+// Callers hold h.mu.RLock and initialize transfer state before calling this.
+func (h *DeviceHandle) submitRegisteredURB(urbPtr uintptr, callback func(error), submit func() error) error {
 	h.reapMutex.Lock()
 	defer h.reapMutex.Unlock()
 
@@ -156,6 +151,10 @@ func (h *DeviceHandle) registerURBCompletion(urbPtr uintptr, callback func(error
 	}
 
 	h.reapMap[urbPtr] = callback
+	if err := submit(); err != nil {
+		delete(h.reapMap, urbPtr)
+		return err
+	}
 	return nil
 }
 

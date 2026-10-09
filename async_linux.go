@@ -140,16 +140,21 @@ func (t *AsyncTransfer) IsoPackets() []IsoPacket {
 
 // Submit submits the transfer for execution
 func (t *AsyncTransfer) Submit() error {
-	if t.submitted {
-		return fmt.Errorf("transfer already submitted")
-	}
-
 	t.handle.mu.RLock()
 	defer t.handle.mu.RUnlock()
 
 	if t.handle.closed {
 		return ErrDeviceNotFound
 	}
+
+	t.reapCond.L.Lock()
+	defer t.reapCond.L.Unlock()
+	if t.submitted {
+		return fmt.Errorf("transfer already submitted")
+	}
+	t.submitted = true
+	t.reaped = false
+	t.reapErr = nil
 
 	// Reset URB fields
 	t.urb.Status = 0
@@ -158,8 +163,8 @@ func (t *AsyncTransfer) Submit() error {
 
 	// Set up iso packets if needed
 	if t.transferType == TransferTypeIsochronous && len(t.isoPackets) > 0 {
-		isoPackets := (*[1 << 16]IsoPacketDescriptor)(unsafe.Pointer(
-			uintptr(unsafe.Pointer(t.urb)) + unsafe.Sizeof(URB{})))
+		isoPackets := unsafe.Slice((*IsoPacketDescriptor)(unsafe.Pointer(
+			uintptr(unsafe.Pointer(t.urb))+unsafe.Sizeof(URB{}))), len(t.isoPackets))
 		for i := range t.isoPackets {
 			isoPackets[i].Length = uint32(t.isoPackets[i].Length)
 			isoPackets[i].ActualLength = 0
@@ -167,23 +172,7 @@ func (t *AsyncTransfer) Submit() error {
 		}
 	}
 
-	// Submit URB to kernel
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_IOCTL,
-		uintptr(t.handle.fd),
-		USBDEVFS_SUBMITURB,
-		uintptr(unsafe.Pointer(t.urb)),
-	)
-
-	if errno != 0 {
-		return fmt.Errorf("failed to submit URB: %v", errno)
-	}
-
-	t.submitted = true
-	t.reaped = false
-
-	// Register with centralized reaper
-	err := t.handle.registerURBCompletion(uintptr(unsafe.Pointer(t.urb)), func(err error) {
+	err := t.handle.submitRegisteredURB(uintptr(unsafe.Pointer(t.urb)), func(err error) {
 		// Process URB completion
 		t.reapCond.L.Lock()
 		defer t.reapCond.L.Unlock()
@@ -195,8 +184,8 @@ func (t *AsyncTransfer) Submit() error {
 
 			// Update iso packets if needed
 			if t.transferType == TransferTypeIsochronous && len(t.isoPackets) > 0 {
-				isoPackets := (*[1 << 16]IsoPacketDescriptor)(unsafe.Pointer(
-					uintptr(unsafe.Pointer(t.urb)) + unsafe.Sizeof(URB{})))
+				isoPackets := unsafe.Slice((*IsoPacketDescriptor)(unsafe.Pointer(
+					uintptr(unsafe.Pointer(t.urb))+unsafe.Sizeof(URB{}))), len(t.isoPackets))
 				for i := range t.isoPackets {
 					t.isoPackets[i].ActualLength = int(isoPackets[i].ActualLength)
 					t.isoPackets[i].Status = int(isoPackets[i].Status)
@@ -208,10 +197,18 @@ func (t *AsyncTransfer) Submit() error {
 		t.submitted = false
 		t.reaped = true
 		t.reapCond.Broadcast()
+	}, func() error {
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(t.handle.fd), USBDEVFS_SUBMITURB, uintptr(unsafe.Pointer(t.urb)))
+		if errno != 0 {
+			return fmt.Errorf("failed to submit URB: %w", errno)
+		}
+		return nil
 	})
 	if err != nil {
-		syscall.Syscall(syscall.SYS_IOCTL, uintptr(t.handle.fd), USBDEVFS_DISCARDURB, uintptr(unsafe.Pointer(t.urb)))
 		t.submitted = false
+		t.reaped = true
+		t.reapErr = err
+		t.reapCond.Broadcast()
 		return err
 	}
 
@@ -220,10 +217,12 @@ func (t *AsyncTransfer) Submit() error {
 
 // Cancel cancels the transfer
 func (t *AsyncTransfer) Cancel() error {
-	if !t.submitted {
+	t.reapCond.L.Lock()
+	submitted := t.submitted
+	t.reapCond.L.Unlock()
+	if !submitted {
 		return fmt.Errorf("transfer not submitted")
 	}
-
 	t.handle.mu.RLock()
 	defer t.handle.mu.RUnlock()
 
